@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import readline from 'readline';
 import fs from 'fs';
 import xlsx from 'xlsx';
+import mammoth from 'mammoth';
 import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
@@ -23,6 +24,164 @@ const supabase = createClient(
 );
 
 const upload = multer({ dest: 'uploads/' });
+
+// --- Helper parsing file soal ---
+// Excel: kolom pertanyaan, opsi_a/opsi_b/opsi_c/opsi_d (atau A/B/C/D), jawaban_benar
+const parseExcelSoal = (filePath) => {
+  const workbook = xlsx.readFile(filePath);
+  const sheetName = workbook.SheetNames[0];
+  const sheetData = xlsx.utils.sheet_to_json(workbook.Sheets[sheetName]);
+
+  const parsedSoal = [];
+  sheetData.forEach((row) => {
+    const pertanyaan = row.pertanyaan || row.Pertanyaan || row.question || '';
+    if (!pertanyaan) return;
+
+    const opsi_a = row.opsi_a || row.A || '';
+    const opsi_b = row.opsi_b || row.B || '';
+    const opsi_c = row.opsi_c || row.C || '';
+    const opsi_d = row.opsi_d || row.D || '';
+
+    parsedSoal.push({
+      urutan: parsedSoal.length + 1,
+      tipe: !opsi_a && !opsi_b && !opsi_c && !opsi_d ? 'essay' : 'pg',
+      pertanyaan,
+      opsi_a,
+      opsi_b,
+      opsi_c,
+      opsi_d,
+      jawaban_benar: row.jawaban_benar || row.jawaban || row.Kunci || ''
+    });
+  });
+
+  return parsedSoal;
+};
+
+// Word (.docx) format per soal:
+//   1. Teks pertanyaan
+//   A. opsi A
+//   B. opsi B
+//   C. opsi C
+//   D. opsi D
+//   Jawaban: A
+// Parser soal dari file .docx.
+// Format yang didukung:
+//   A. Bernomor: "1. soal" A. opsi ... Jawaban: A
+//   B. Auto-list Word (mammoth hilangkan penomoran): "soal" "2" "3" "4" "5" "Jawabannya A. 2"
+const parseDocxSoal = async (filePath) => {
+  const { value: text } = await mammoth.extractRawText({ path: filePath });
+  const lines = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => l.replace(/^[•◦▪·‣\-*]\s+/, '').trim());
+
+  const parsedSoal = [];
+  let current = null;
+  let pending = [];
+
+  const newSoal = () => ({
+    urutan: parsedSoal.length + 1,
+    tipe: 'essay',
+    pertanyaan: '',
+    opsi_a: '',
+    opsi_b: '',
+    opsi_c: '',
+    opsi_d: '',
+    jawaban_benar: ''
+  });
+
+  const buildDariPending = (teksJawaban) => {
+    if (pending.length < 1) return;
+    const pertanyaan = pending[0];
+    const kandidatOpsi = pending.slice(1).filter((x) => x);
+    const opsi = kandidatOpsi.slice(0, 4);
+
+    const soal = newSoal();
+    if (opsi.length >= 2 && opsi.length <= 4) {
+      soal.tipe = 'pg';
+      soal.pertanyaan = pertanyaan;
+      const listOpsi = ['a', 'b', 'c', 'd'];
+      opsi.forEach((val, idx) => { soal[`opsi_${listOpsi[idx]}`] = val; });
+      if (teksJawaban) {
+        const huruf = teksJawaban.match(/^\s*([A-D])/i);
+        soal.jawaban_benar = huruf ? huruf[1].toUpperCase() : teksJawaban;
+      }
+    } else {
+      soal.tipe = 'essay';
+      soal.pertanyaan = pending.join(' ');
+      soal.jawaban_benar = teksJawaban || '';
+    }
+    parsedSoal.push(soal);
+    pending = [];
+  };
+
+  const finalizeCurrent = () => {
+    if (current) {
+      parsedSoal.push(current);
+      current = null;
+    }
+  };
+
+  for (const line of lines) {
+    const matchSoal = line.match(/^\s*\d{1,3}[\.\)]\s+(.+)/);
+    const matchOpsi = line.match(/^\s*([A-D])\s*[\.\)\-:]\s+(.+)/i);
+    const matchJawaban = line.match(
+      /^(?:jawaban(?:nya| acuan)?|kunci(?:nya)?)\s*[:\-.]?\s*(.+)/i,
+    );
+
+    if (matchJawaban && matchJawaban[1]) {
+      const teksJawaban = matchJawaban[1].trim();
+
+      if (current) {
+        current.jawaban_benar = teksJawaban;
+        if (current.opsi_a) current.tipe = 'pg';
+        finalizeCurrent();
+      } else {
+        buildDariPending(teksJawaban);
+      }
+    } else if (matchSoal) {
+      finalizeCurrent();
+      buildDariPending(null);
+      current = newSoal();
+      current.pertanyaan = matchSoal[1].trim();
+    } else if (matchOpsi) {
+      if (!current) {
+        // Mulai soal tanpa nomor: baris pending pertama = pertanyaan, sisanya lanjutan.
+        current = newSoal();
+        const sisaPending = pending.slice(1);
+        current.pertanyaan = pending[0] || '';
+        if (sisaPending.length) {
+          current.pertanyaan += (current.pertanyaan ? ' ' : '') + sisaPending.join(' ');
+        }
+        pending = [];
+      }
+      current[`opsi_${matchOpsi[1].toLowerCase()}`] = matchOpsi[2].trim();
+    } else {
+      pending.push(line);
+    }
+  }
+
+  finalizeCurrent();
+  buildDariPending(null);
+
+  parsedSoal.forEach((soal) => {
+    if (soal.opsi_a || soal.opsi_b || soal.opsi_c || soal.opsi_d) {
+      soal.tipe = 'pg';
+    }
+  });
+
+  return parsedSoal;
+};
+
+const parseFileSoal = async (filePath, originalName) => {
+  const ext = (originalName || '').split('.').pop().toLowerCase();
+
+  if (ext === 'docx') return parseDocxSoal(filePath);
+  if (ext === 'xlsx' || ext === 'xls') return parseExcelSoal(filePath);
+
+  throw new Error('Format file tidak didukung. Gunakan .xlsx, .xls, atau .docx');
+};
 
 // --- API KUIS ---
 app.post('/api/kuis/import', upload.single('file'), async (req, res) => {
@@ -108,41 +267,13 @@ app.post('/api/kuis/preview', upload.single('file'), async (req, res) => {
     }
 
     const filePath = req.file.path;
-
-    const workbook = xlsx.readFile(filePath);
-    const sheetName = workbook.SheetNames[0];
-    const sheetData = xlsx.utils.sheet_to_json(workbook.Sheets[sheetName]);
+    const parsedSoal = await parseFileSoal(filePath, req.file.originalname);
 
     fs.unlinkSync(filePath);
 
-    if (sheetData.length === 0) {
-      return res.status(400).json({ success: false, error: "File kosong" });
+    if (parsedSoal.length === 0) {
+      return res.status(400).json({ success: false, error: "Tidak ada soal yang terbaca dari file. Periksa format file." });
     }
-
-    let parsedSoal = [];
-    sheetData.forEach((row, index) => {
-      const pertanyaan = row.pertanyaan || row.Pertanyaan || row.question || '';
-      if (!pertanyaan) return;
-
-      const opsi_a = row.opsi_a || row.A || '';
-      const opsi_b = row.opsi_b || row.B || '';
-      const opsi_c = row.opsi_c || row.C || '';
-      const opsi_d = row.opsi_d || row.D || '';
-
-      // Tentukan tipe soal: jika semua opsi kosong, maka dianggap 'essay'
-      const isEssay = !opsi_a && !opsi_b && !opsi_c && !opsi_d;
-
-      parsedSoal.push({
-        urutan: parsedSoal.length + 1,
-        tipe: isEssay ? 'essay' : 'pg',
-        pertanyaan,
-        opsi_a,
-        opsi_b,
-        opsi_c,
-        opsi_d,
-        jawaban_benar: row.jawaban_benar || row.jawaban || row.Kunci || ''
-      });
-    });
 
     res.json({ 
       success: true, 
@@ -159,8 +290,35 @@ app.post('/api/kuis/preview', upload.single('file'), async (req, res) => {
 });
 
 // --- API ADMIN USERS ---
-app.post('/api/admin/users', async (req, res) => {
+// Reset password user via Supabase Admin API (harus service key)
+app.post('/api/admin/users/reset-password', async (req, res) => {
   try {
+    const { user_id, password } = req.body;
+
+    if (!user_id) {
+      return res.status(400).json({ success: false, error: "user_id wajib diisi" });
+    }
+
+    const defaultPassword = password || 'Password123';
+
+    const { error } = await supabase.auth.admin.updateUserById(user_id, {
+      password: defaultPassword,
+      email_confirm: true,
+    });
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      message: `Password berhasil direset menjadi "${defaultPassword}"`,
+    });
+  } catch (err) {
+    console.error("Reset Password Error:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/admin/users', async (req, res) => {  try {
     const payload = req.body;
 
     if (!payload.email || !payload.nama || !payload.role) {
